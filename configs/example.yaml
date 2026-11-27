@@ -1,0 +1,8 @@
+# Example PAGE configuration. Paths are supplied by the caller.
+rank: 64
+k: 8
+clusters: 8
+quantile: 0.90
+threshold_scale: 1.50
+pool: max3
+eta: 1.0

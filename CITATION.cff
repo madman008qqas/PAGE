@@ -1,0 +1,8 @@
+cff-version: 1.2.0
+title: "PAGE: Patch-wise Anomaly-Gated Editing"
+message: "If you use PAGE, please cite the accompanying paper."
+authors:
+  - family-names: "PAGE contributors"
+year: 2026
+license: MIT
+repository-code: "https://github.com/madman008qqas/PAGE"
