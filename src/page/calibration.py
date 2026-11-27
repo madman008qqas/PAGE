@@ -20,7 +20,8 @@ class CalibrationConfig:
     alpha_max: float = 3.0
     alpha_step: float = 0.05
     pool: str = 'max3'
-    local_window: int = 9
+    calib_local_window: int = 1
+    online_local_window: int = 9
     grid: tuple[int, int] = (16, 16)
     eta: float = 1.0
 
@@ -98,7 +99,7 @@ def calibrate_thresholds(features, states, basis, config=CalibrationConfig(), de
         for camera in range(x.shape[1]):
             score = exemplar_minimum_score(
                 residual[row, camera], residual[neighbours, camera], residual_scale[camera],
-                grid=config.grid, local_window=config.local_window,
+                grid=config.grid, local_window=config.calib_local_window,
             )
             scores[row, camera] = score
             distance = ((residual[row, camera][None] - residual[neighbours, camera]) /

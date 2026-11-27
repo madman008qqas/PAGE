@@ -22,7 +22,8 @@ def main() -> None:
         clean_states,
         basis,
         config=CalibrationConfig(
-            rank=2, clusters=2, k=2, local_window=3, grid=(4, 4),
+            rank=2, clusters=2, k=2, calib_local_window=1, online_local_window=3,
+            grid=(4, 4),
             alpha_min=1.0, alpha_max=5.0, alpha_step=0.25,
         ),
         device=device,

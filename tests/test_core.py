@@ -2,10 +2,32 @@ import unittest
 
 import torch
 
-from page import patch_intervention_normres_v4
+from page import exemplar_minimum_score, patch_intervention_normres_v4
 
 
-class CoreContractTest(unittest.TestCase):
+class TestCoreContract(unittest.TestCase):
+    def test_exemplar_minimum_uses_reference_neighbourhood(self):
+        grid = (5, 5)
+        center = 2 * grid[1] + 2
+        shifted = 2 * grid[1] + 3
+        reference = torch.zeros(1, 25, 1)
+        reference[:, center, 0] = 1.0
+        scale = torch.ones(25, 1)
+
+        translated = torch.zeros(25, 1)
+        translated[shifted, 0] = 1.0
+        translated_score = exemplar_minimum_score(
+            translated, reference, scale, grid=grid, local_window=3
+        )
+        self.assertEqual(float(translated_score[shifted]), 0.0)
+
+        distractor = torch.zeros(25, 1)
+        distractor[center, 0] = 1.0
+        distractor_score = exemplar_minimum_score(
+            distractor, torch.zeros_like(reference), scale, grid=grid, local_window=3
+        )
+        self.assertGreater(float(distractor_score[center]), 0.5)
+
     def test_default_is_explicit_par_and_hard_replace_keeps_gate(self):
         torch.manual_seed(3)
         y = torch.randn(1, 16, 8)

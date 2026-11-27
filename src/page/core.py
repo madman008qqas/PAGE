@@ -21,20 +21,45 @@ def _channel_mean_squared(value: torch.Tensor) -> torch.Tensor:
 def exemplar_minimum_score(query_perp: torch.Tensor, reference_perp: torch.Tensor,
                            residual_scale: torch.Tensor, grid: tuple[int, int] = (16, 16),
                            local_window: int = 9) -> torch.Tensor:
-    """Return the minimum normalized residual over K exemplars and a local window."""
+    """Return the minimum normalized residual over K exemplars and a local window.
+
+    The query position stays fixed while reference positions in its valid local
+    neighbourhood are compared. Out-of-bounds neighbours contribute ``+inf``.
+    """
     if reference_perp.ndim != 3:
         raise ValueError("reference_perp must have shape (K, patches, channels)")
     if local_window % 2 == 0:
         raise ValueError("local_window must be odd")
-    scale = residual_scale.clamp_min(1e-6)
-    distance = _channel_mean_squared((query_perp[None] - reference_perp) / scale[None])
-    local = -F.max_pool2d(
-        -distance.reshape(distance.shape[0], 1, grid[0], grid[1]),
-        local_window,
-        stride=1,
-        padding=local_window // 2,
-    ).reshape(distance.shape[0], grid[0] * grid[1])
-    return local.min(0).values
+    height, width = grid
+    patches = height * width
+    query = query_perp.reshape(patches, -1)
+    reference = reference_perp.reshape(reference_perp.shape[0], patches, -1)
+    if residual_scale.numel() == query.shape[-1]:
+        scale = residual_scale.reshape(1, -1).expand(patches, -1)
+    else:
+        scale = residual_scale.reshape(patches, -1)
+    scale = scale.clamp_min(1e-6)
+    radius = local_window // 2
+    scores = torch.full(
+        (reference.shape[0], patches), float('inf'), device=query.device, dtype=query.dtype
+    )
+    rows = torch.arange(height, device=query.device)
+    cols = torch.arange(width, device=query.device)
+    query_rows, query_cols = torch.meshgrid(rows, cols, indexing='ij')
+    query_rows = query_rows.reshape(-1)
+    query_cols = query_cols.reshape(-1)
+    for dy in range(-radius, radius + 1):
+        for dx in range(-radius, radius + 1):
+            ref_rows = query_rows + dy
+            ref_cols = query_cols + dx
+            valid = (ref_rows >= 0) & (ref_rows < height) & (ref_cols >= 0) & (ref_cols < width)
+            query_indices = torch.nonzero(valid, as_tuple=False).flatten()
+            reference_indices = ref_rows[valid] * width + ref_cols[valid]
+            difference = (query[query_indices][None] - reference[:, reference_indices])
+            difference = difference / scale[query_indices][None]
+            local_scores = _channel_mean_squared(difference)
+            scores[:, query_indices] = torch.minimum(scores[:, query_indices], local_scores)
+    return scores.min(0).values
 
 
 @torch.inference_mode()
