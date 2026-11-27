@@ -49,7 +49,7 @@ The released configuration is the unbudgeted pooled 9×9 PAGE method. Counts are
 | `place_object_basket` | 70/100 | 29/100 | 70/100 | 31/50 |
 | **Mean success rate** | **85.7%** | **23.9%** | **84.4%** | **50.3%** |
 
-The C2R mean changes from 23.9% to 50.3% (**+26.4 pp**), while the C2C mean changes from 85.7% to 84.4%.
+The C2R mean changes from 23.9% to 50.3% (**+26.4 pp**), while the C2C success rate is almost unaffected.
 
 ### VLA-Arena
 
