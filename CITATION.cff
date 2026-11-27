@@ -1,5 +1,5 @@
 cff-version: 1.2.0
-title: "PAGE: Patch-wise Anomaly-Gated Editing"
+title: "PAGE: Repurposing Clean Demonstrations for Test-Time Visual Feature Repair in Frozen VLA Policies"
 message: "If you use PAGE, please cite the accompanying paper."
 authors:
   - family-names: "PAGE contributors"
