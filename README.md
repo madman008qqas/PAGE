@@ -29,34 +29,34 @@ The released configuration is the pooled 9×9 PAGE variant. Counts below are suc
 
 ### RoboTwin 2.0, π0.5
 
-| Task | Official vanilla C2C | Official vanilla C2R | PAGE C2C | PAGE C2R |
-|---|---:|---:|---:|---:|
-| `lift_pot` | 98/100 | 35/100 | 97/100 | 26/50 |
-| `beat_block_hammer` | 93/100 | 23/100 | 92/100 | 19/50 |
-| `rotate_qrcode` | 90/100 | 21/100 | 84/100 | 29/50 |
-| `handover_mic` | 98/100 | 6/100 | 99/100 | 21/50 |
-| `stack_blocks_two` | 91/100 | 43/100 | 89/100 | 32/50 |
-| `stack_blocks_three` | 77/100 | 25/100 | 59/100 | 16/50 |
-| `move_can_pot` | 60/100 | 10/100 | 60/100 | 18/50 |
-| `place_can_basket` | 56/100 | 10/100 | 64/100 | 12/50 |
-| `place_object_basket` | 70/100 | 29/100 | 70/100 | 31/50 |
-| `place_object_scale` | 78/100 | 38/100 | 70/100 | 21/50 |
-| **Mean success rate** | **81.1%** | **24.0%** | **64.6%** | **39.2%** |
+| Task | Official vanilla C2C | Official vanilla C2R | Local vanilla C2C | Local vanilla C2R | PAGE C2C | PAGE C2R |
+|---|---:|---:|---:|---:|---:|---:|
+| `lift_pot` | 98/100 | 35/100 | 50/50 | 19/50 | 97/100 | 26/50 |
+| `beat_block_hammer` | 93/100 | 23/100 | 85/100 | 6/50 | 92/100 | 19/50 |
+| `rotate_qrcode` | 90/100 | 21/100 | 91/100 | 10/50 | 84/100 | 29/50 |
+| `handover_mic` | 98/100 | 6/100 | 99/100 | 4/50 | 99/100 | 21/50 |
+| `stack_blocks_two` | 91/100 | 43/100 | 93/100 | 22/50 | 89/100 | 32/50 |
+| `move_can_pot` | 60% | 10% | 59/100 | 6/50 | 60/100 | 18/50 |
+| `place_object_basket` | 70% | 29% | — | — | 70/100 | 31/50 |
+| **Mean success rate** | **85.7%** | **23.9%** | **87.8% (6 tasks)** | **22.3% (6 tasks)** | **84.4%** | **50.3%** |
 
-The 10-task PAGE aggregates are 323/500 C2C and 98/250 C2R. Official entries are shown for orientation and retain the benchmark's published protocol.
+The current ledger covers seven RoboTwin tasks. The local vanilla averages exclude `place_object_basket`, for which no same-protocol local vanilla result is registered.
 
 ### VLA-Arena
 
-| Frozen backbone | L0 clean | L1 static distractors |
-|---|---:|---:|
-| π0.5 vanilla | 132/150 | 9/150 |
-| π0.5 + PAGE | 123/150 | 51/150 |
-| OpenVLA-OFT vanilla | 144/150 | 21/150 |
-| OpenVLA-OFT + PAGE | 144/150 | 51/150 |
+| Frozen backbone | Official vanilla L0 | Official vanilla L1 | Local vanilla L0 | Local vanilla L1 | PAGE L0 | PAGE L1 |
+|---|---:|---:|---:|---:|---:|---:|
+| π0.5 | 88% | 6% | 132/150 | 9/150 | 132/150 | 51/150 |
+| OpenVLA-OFT | 96% | 14% | 144/150 | 21/150 | 144/150 | 51/150 |
+| **Mean success rate** | **92.0%** | **10.0%** | **92.0%** | **10.0%** | **92.0%** | **34.0%** |
 
 ### Physical dual-arm evaluation
 
 On AgileX Cobot Magic dual-PiPER hardware, both methods completed 25/25 clean trials. Under visual interference, frozen vanilla achieved 14/25 and PAGE achieved 20/25.
+
+![AgileX dual-arm real-robot evaluation](figures/PAGE_Figure5_real_robot.png)
+
+The figure shows the dual-arm platform and representative clean and visual-interference rollouts.
 
 PAGE adds under 10 ms of steady-state latency per policy step in the reported deployment measurements. The reference residuals remain resident on the GPU, with approximately 1.8 GiB additional allocated memory in that measurement.
 
