@@ -1,185 +1,150 @@
-# Adapted from work-station patch_gate_core_r4.py, SHA-256:
-# 7757629eb5e9cd85baf06f66ebdf79c1bdf06c5ee970962c9167731922df6a9b
-# Only layout/shape parameters changed; arithmetic and budget denominator preserved.
-"""Independent-patch anomaly gate core, r4.
+"""PAGE's exemplar-minimum gate and PAR feature repair."""
 
-r3 plus exactly one mechanism:
-
-  D) score pooling -- the decision score of a patch is pooled over its spatial
-     neighbourhood of patches before it is compared against the threshold:
-
-       pool='none'   (r3 / r2 behaviour)      the patch's own score
-       pool='max3'   3x3 neighbourhood, max
-       pool='mean3'  3x3 neighbourhood, mean
-       pool='mean5'  5x5 neighbourhood, mean
-
-     Rationale (measured, not assumed): pooling raises the interference detection
-     rate at any fixed clean firing rate, but only if the threshold is recalibrated
-     on the pooled score -- dilating the mask after the fact blows the clean side up
-     from 11.86% to 34.36%. The threshold therefore has to be built from pooled
-     scores, which is what the r4 gate builder does.
-
-The adapter supplies the valid patch grid (VLA-Arena: full 16x16).
-The original RoboTwin layout is recovered with grid=(12,16), valid_start=32.
-Padding follows the original scripts exactly:
-max-pooling uses torch's implicit -inf padding, mean-pooling replicates the edge.
-
-With `pool='none'` no extra arithmetic is executed, so the operator is bitwise
-identical to `patch_intervention_normres_v3` (asserted by test_patch_gate_core_r4).
-"""
+from __future__ import annotations
 
 import torch
 import torch.nn.functional as F
 
-NTERMS = 3
-POOLS = ('none', 'max3', 'mean3', 'mean5')
+
+def _max_pool(scores: torch.Tensor, grid: tuple[int, int], kernel: int) -> torch.Tensor:
+    height, width = grid
+    padding = kernel // 2
+    x = scores.reshape(scores.shape[0], 1, height, width)
+    return F.max_pool2d(x, kernel, stride=1, padding=padding).reshape(scores.shape[0], height * width)
 
 
-def _agg_channels(sq, topk_channels):
-    """Reduce a (1,192,D) tensor of squared standardised residuals over channels."""
-    if topk_channels is None:
-        return sq.mean(-1)
-    k = int(topk_channels)
-    if not 0 < k <= sq.shape[-1]:
-        raise RuntimeError(f'invalid topk_channels {k} for {sq.shape[-1]} channels')
-    if k == sq.shape[-1]:
-        # identical arithmetic to the plain mean; do not route through topk, whose
-        # summation order differs and would break the bitwise r2 equivalence claim.
-        return sq.mean(-1)
-    return torch.topk(sq, k, dim=-1).values.mean(-1)
-
-
-def _pool_scores(scores, pool, grid):
-    GH, GW = grid
-    NVALID = GH * GW
-    """Pool a (1,192) decision score over the 12x16 valid-patch grid."""
-    if pool == 'none':
-        return scores
-    if pool not in POOLS:
-        raise RuntimeError(f'unknown pool {pool!r}')
-    x = scores.reshape(1, 1, GH, GW)
-    if pool == 'max3':
-        return F.max_pool2d(x, 3, stride=1, padding=1).reshape(1, NVALID)
-    if pool == 'mean3':
-        return F.avg_pool2d(F.pad(x, (1, 1, 1, 1), mode='replicate'), 3, stride=1).reshape(1, NVALID)
-    return F.avg_pool2d(F.pad(x, (2, 2, 2, 2), mode='replicate'), 5, stride=1).reshape(1, NVALID)
+def _channel_mean_squared(value: torch.Tensor) -> torch.Tensor:
+    return value.square().mean(-1)
 
 
 @torch.inference_mode()
-def patch_intervention_normres_v4(y, mu, ref, U, lam, sig2, thresholds, tau, rho,
-                                  residual_mean, residual_scale,
-                                  cluster_id=0, score_mean=None, score_scale=None,
-                                  fusion_alpha=1.0, fusion_beta=0.0, fusion_gamma=0.0,
-                                  topk_channels=None, pool='none', eps=1e-6,
-                                  valid_start=0, grid=(16, 16)):
-    NVALID = grid[0] * grid[1]
-    D = y.shape[-1]
-    stop = valid_start + NVALID
-    if y.ndim != 3 or y.shape[0] != 1 or valid_start < 0 or stop > y.shape[1]:
-        raise RuntimeError(f'unexpected feature shape {tuple(y.shape)}')
-    if tuple(mu.shape) != (NVALID, D) or tuple(ref.shape) != (NVALID, D):
-        raise RuntimeError(f'unexpected mu/ref shape {tuple(mu.shape)} {tuple(ref.shape)}')
-    if tuple(residual_mean.shape) != (NVALID, D) or tuple(residual_scale.shape) != (NVALID, D):
-        raise RuntimeError('unexpected normalized residual stats shape')
-    if thresholds.ndim != 2 or thresholds.shape[1] != NVALID or not torch.isfinite(thresholds).all():
-        raise RuntimeError(f'invalid per-patch thresholds {tuple(thresholds.shape)}')
-    # r2's score is a non-negative squared residual, so r2 can demand thresholds > 0. The r3/r4
-    # score is standardised and/or fused, and its clean q90 can legitimately sit slightly
-    # below zero when most of the mass lies just under the mean with a short right tail.
-    if (lam <= 0).any() or (residual_scale <= 0).any():
-        raise RuntimeError('non-positive eigenvalue or residual scale')
-    if sig2 <= 0 or tau <= 0 or not 0 < rho <= 1 or eps <= 0:
-        raise RuntimeError('invalid sig2/tau/rho/eps')
-    if pool not in POOLS:
-        raise RuntimeError(f'unknown pool {pool!r}')
-    nt = int(thresholds.shape[0])
-    cid = int(cluster_id)
-    if not 0 <= cid < nt:
-        raise RuntimeError(f'state cluster id {cid} outside [0,{nt})')
-    if score_mean is None:
-        score_mean = torch.zeros(NVALID, NTERMS, device=y.device, dtype=torch.float32)
-    if score_scale is None:
-        score_scale = torch.ones(NVALID, NTERMS, device=y.device, dtype=torch.float32)
-    if tuple(score_mean.shape) != (NVALID, NTERMS) or tuple(score_scale.shape) != (NVALID, NTERMS):
-        raise RuntimeError(f'unexpected score stats shape {tuple(score_mean.shape)}')
-    if (score_scale <= 0).any():
-        raise RuntimeError('non-positive score scale')
+def exemplar_minimum_score(query_perp: torch.Tensor, reference_perp: torch.Tensor,
+                           residual_scale: torch.Tensor, grid: tuple[int, int] = (16, 16),
+                           local_window: int = 9) -> torch.Tensor:
+    """Return the minimum normalized residual over K exemplars and a local window."""
+    if reference_perp.ndim != 3:
+        raise ValueError("reference_perp must have shape (K, patches, channels)")
+    if local_window % 2 == 0:
+        raise ValueError("local_window must be odd")
+    scale = residual_scale.clamp_min(1e-6)
+    distance = _channel_mean_squared((query_perp[None] - reference_perp) / scale[None])
+    local = -F.max_pool2d(
+        -distance.reshape(distance.shape[0], 1, grid[0], grid[1]),
+        local_window,
+        stride=1,
+        padding=local_window // 2,
+    ).reshape(distance.shape[0], grid[0] * grid[1])
+    return local.min(0).values
 
-    yv = y[:, valid_start:stop, :].float()
+
+@torch.inference_mode()
+def patch_intervention_normres_v4(
+    y: torch.Tensor,
+    mu: torch.Tensor,
+    ref: torch.Tensor,
+    U: torch.Tensor,
+    lam: torch.Tensor,
+    sig2: float,
+    thresholds: torch.Tensor,
+    tau: float,
+    rho: float | None = None,
+    residual_mean: torch.Tensor | None = None,
+    residual_scale: torch.Tensor | None = None,
+    cluster_id: int = 0,
+    score_mean: torch.Tensor | None = None,
+    score_scale: torch.Tensor | None = None,
+    pool: str = 'max3',
+    valid_start: int = 0,
+    grid: tuple[int, int] = (16, 16),
+    reference_bank: torch.Tensor | None = None,
+    local_window: int = 9,
+    repair_mode: str = 'par',
+) -> tuple[torch.Tensor, dict]:
+    """Score and repair one camera's patch features.
+
+    ``reference_bank`` contains the K pose-matched clean feature tensors. When it
+    is supplied, the gate uses the minimum normalized residual over those K
+    exemplars and each patch's local ``local_window`` neighbourhood. The edit
+    target remains ``ref``, the original-position K-exemplar mean.
+
+    ``repair_mode='par'`` applies the reliability-guided soft contraction
+    ``m_i + w_i (y_i - m_i)``. Omitting ``rho`` selects the current unbudgeted
+    contract with unit edit strength.
+    """
+    if y.ndim != 3 or y.shape[0] != 1:
+        raise ValueError(f"y must have shape (1, patches, channels), got {tuple(y.shape)}")
+    if repair_mode not in {'par', 'hard_replace'}:
+        raise ValueError("repair_mode must be 'par' or 'hard_replace'")
+    patches = grid[0] * grid[1]
+    stop = valid_start + patches
+    if stop > y.shape[1]:
+        raise ValueError("valid patch range exceeds feature tensor")
+    yv = y[:, valid_start:stop].float()
+    if residual_mean is None:
+        residual_mean = torch.zeros_like(mu)
+    if residual_scale is None:
+        residual_scale = torch.ones_like(mu)
+    rs = residual_scale.clamp_min(1e-6)
+
     d = yv - mu
     z = d @ U
     perp = d - z @ U.t()
-    rs = residual_scale.clamp_min(eps)
     normalized = (perp - residual_mean) / rs
+    residual_score = _channel_mean_squared(normalized)[0]
 
-    # --- evidence terms, each (1,192) -------------------------------------------------
-    t_resid = _agg_channels(normalized.square(), topk_channels)
-    t_ref = ((yv - ref) / rs).square().mean(-1)
-    t_bg = (d / rs).square().mean(-1)
-    terms = torch.stack((t_resid, t_ref, t_bg), dim=-1)[0]          # (192,3)
+    if reference_bank is not None:
+        bank = reference_bank.float()
+        bank_delta = bank - mu[None]
+        bank_latent = bank_delta @ U
+        bank_perp = bank_delta - bank_latent @ U.t()
+        gate_score = exemplar_minimum_score(
+            perp[0], bank_perp, rs, grid=grid, local_window=local_window
+        )
+    else:
+        gate_score = residual_score
 
-    # --- B: state-conditioned standardisation (identity when conditioning is off) -----
-    zt = (terms - score_mean) / score_scale.clamp_min(eps)          # (192,3)
+    if pool == 'max3':
+        gate_score = _max_pool(gate_score[None], grid, 3)[0]
+    elif pool != 'none':
+        raise ValueError("pool must be 'none' or 'max3'")
 
-    # --- C: score fusion (residual only when beta=gamma=0) ---------------------------
-    scores = fusion_alpha * zt[:, 0]
-    if fusion_beta != 0.0:
-        scores = scores + fusion_beta * zt[:, 1]
-    if fusion_gamma != 0.0:
-        scores = scores + fusion_gamma * zt[:, 2]
-    scores = scores[None]                                           # (1,192)
+    if score_mean is not None and score_scale is not None:
+        gate_score = (gate_score - score_mean[:, 0]) / score_scale[:, 0].clamp_min(1e-6)
+    mask = gate_score > thresholds[cluster_id]
 
-    # --- D: spatial pooling of the decision score ------------------------------------
-    if pool != 'none':
-        scores = _pool_scores(scores, pool, grid)
-
-    mask = scores > thresholds[cid][None]
-
-    # --- edit path: identical to r2/r3 ------------------------------------------------
-    sc = (z * z / lam).sum(-1) + (perp * perp / sig2).sum(-1)
-    a = -sc
-    sd = a.std(1, keepdim=True, correction=0) + 1e-6
-    w = torch.exp((a - a.max(1, keepdim=True).values) / (tau * sd))
-    candidate_delta = ref[None] + w[..., None] * (yv - ref[None]) - yv
-    zeros = torch.zeros_like(candidate_delta)
-    delta = torch.where(mask[..., None], candidate_delta, zeros)
-    n = delta.abs().sum((-1, -2), keepdim=True)
-    den = d.abs().sum((-1, -2), keepdim=True)
-    eta = torch.where(n > 1e-12, torch.minimum(torch.ones_like(n), rho * den / n.clamp_min(1e-12)), torch.zeros_like(n))
+    score = (z.square() / lam).sum(-1) + (perp.square() / sig2).sum(-1)
+    log_weight = -score
+    spread = log_weight.std(1, keepdim=True, correction=0).clamp_min(1e-6)
+    weight = torch.exp((log_weight - log_weight.max(1, keepdim=True).values) / (tau * spread))
+    if repair_mode == 'hard_replace':
+        weight = torch.zeros_like(weight)
+    candidate_delta = ref[None] + weight[..., None] * (yv - ref[None]) - yv
+    if rho is None:
+        eta = torch.ones((1, 1, 1), device=y.device, dtype=y.dtype)
+    else:
+        raw = candidate_delta.abs().sum((-1, -2), keepdim=True)
+        denominator = d.abs().sum((-1, -2), keepdim=True)
+        eta = torch.where(raw > 1e-12, torch.minimum(torch.ones_like(raw), rho * denominator / raw),
+                          torch.zeros_like(raw))
+    edited = yv + eta * candidate_delta
     out = y.clone()
-    edited = yv + eta * delta
-    out[:, valid_start:stop, :] = torch.where(mask[..., None], edited, yv).to(y.dtype)
+    out[:, valid_start:stop] = torch.where(mask[..., None], edited, yv).to(y.dtype)
+    actual = out[:, valid_start:stop].float() - yv
 
-    active = bool(mask.any())
-    actual = out[:, valid_start:stop, :].float() - yv
-    off = actual[~mask]
-    meta = dict(
-        gate_active=active,
-        gate_raw_active=active,
-        patch_active_count=int(mask.sum()),
-        patch_total_count=int(mask.numel()),
-        patch_mask=mask[0].tolist(),
-        patch_scores=scores[0].tolist(),
-        patch_residual_scores=t_resid[0].tolist(),
-        patch_gate_scores=scores[0].tolist(),
-        patch_terms=terms.tolist(),
-        patch_terms_z=zt.tolist(),
-        patch_thresholds=thresholds[cid].tolist(),
-        patch_score_mode='patch_pca_residual_norm2',
-        patch_state_cluster=cid,
-        patch_score_terms=('resid', 'ref', 'bg'),
-        patch_aggregation=('mean' if topk_channels is None else f'topk{int(topk_channels)}'),
-        patch_pool=pool,
-        fusion_alpha=float(fusion_alpha), fusion_beta=float(fusion_beta), fusion_gamma=float(fusion_gamma),
-        off_patch_maxabs=float(off.abs().max()) if off.numel() else 0.0,
-        padding_maxabs=(float(torch.cat((out[:, :valid_start, :] - y[:, :valid_start, :], out[:, stop:, :] - y[:, stop:, :]), 1).abs().max()) if y.shape[1] > NVALID else 0.0),
-        eta=float(eta.max()),
-        delta_l1=float(n.max()),
-        denom_l1=float(den.max()),
-        applied_delta_l1=float(actual.abs().sum()),
-        budget_limit_l1=float(rho * den.max()),
-        changed_patch_count=int((actual.abs().sum(-1) > 0).sum()),
-        patch_anomaly_score_min=float(scores.min()),
-        patch_anomaly_score_max=float(scores.max()),
-    )
-    return out, meta
+    return out, {
+        'gate_active': bool(mask.any()),
+        'patch_active_count': int(mask.sum()),
+        'patch_total_count': int(mask.numel()),
+        'patch_mask': mask[0].tolist(),
+        'patch_scores': gate_score.tolist(),
+        'patch_residual_scores': residual_score.tolist(),
+        'patch_thresholds': thresholds[cluster_id].tolist(),
+        'patch_pool': pool,
+        'local_window': int(local_window),
+        'support_mode': 'exemplar_min' if reference_bank is not None else 'same_position',
+        'repair_mode': repair_mode,
+        'eta': float(eta.max()),
+        'delta_l1': float(candidate_delta.abs().sum()),
+        'applied_delta_l1': float(actual.abs().sum()),
+        'changed_patch_count': int((actual.abs().sum(-1) > 0).sum()),
+    }

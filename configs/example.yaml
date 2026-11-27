@@ -1,8 +1,13 @@
-# Example PAGE configuration. Paths are supplied by the caller.
+# Frozen PAGE configuration. Paths and feature tensors are supplied by the caller.
 rank: 64
 k: 8
 clusters: 8
 quantile: 0.90
-threshold_scale: 1.50
+target_fpr: 0.015
+alpha_min: 1.0
+alpha_max: 3.0
+alpha_step: 0.05
+local_window: 9
 pool: max3
 eta: 1.0
+repair_mode: par

@@ -1,13 +1,12 @@
-"""Clean-data calibration for the PAGE patch gate.
+"""Clean-only basis fitting and leave-one-out exemplar-min calibration."""
 
-The functions operate on arrays shaped as ``(frames, cameras, patches, dim)``
-and a matching proprioceptive state array shaped as ``(frames, state_dim)``.
-All matrix-heavy operations run on the selected torch device.
-"""
 from dataclasses import dataclass
+
 import numpy as np
 import torch
 import torch.nn.functional as F
+
+from .core import exemplar_minimum_score
 
 
 @dataclass
@@ -16,9 +15,14 @@ class CalibrationConfig:
     clusters: int = 8
     k: int = 8
     quantile: float = 0.90
-    threshold_scale: float = 1.50
+    target_fpr: float = 0.015
+    alpha_min: float = 1.0
+    alpha_max: float = 3.0
+    alpha_step: float = 0.05
     pool: str = 'max3'
-    grid: tuple = (16, 16)
+    local_window: int = 9
+    grid: tuple[int, int] = (16, 16)
+    eta: float = 1.0
 
 
 def fit_background_basis(features, rank=64, device='cuda'):
@@ -42,57 +46,97 @@ def fit_background_basis(features, rank=64, device='cuda'):
                 explained=float(explained))
 
 
-def state_normalize(states):
-    state = torch.as_tensor(np.asarray(states), dtype=torch.float32)
-    mean = state.mean(0)
-    scale = state.std(0, correction=0).clamp_min(1e-6)
-    return state, mean, scale
+def _state_clusters(states: torch.Tensor, count: int):
+    mean = states.mean(0)
+    scale = states.std(0, correction=0).clamp_min(1e-6)
+    normalized = (states - mean) / scale
+    centers = normalized[torch.linspace(0, len(states) - 1, count, device=states.device).long()].clone()
+    for _ in range(40):
+        labels = ((normalized[:, None] - centers[None]) ** 2).sum(-1).argmin(-1)
+        updated = torch.stack([
+            normalized[labels == i].mean(0) if (labels == i).any() else centers[i]
+            for i in range(count)
+        ])
+        if torch.equal(updated, centers):
+            break
+        centers = updated
+    return normalized, mean, scale, centers, labels
 
 
-def knn_indices(states, query, k=8):
-    normalized, mean, scale = state_normalize(states)
-    q = (torch.as_tensor(query, dtype=torch.float32) - mean) / scale
-    distance = ((normalized - q) ** 2).sum(-1)
-    return torch.topk(distance, k, largest=False).indices.cpu().numpy()
-
-
-def _max_pool(scores, grid):
-    frames, patches = scores.shape
-    height, width = grid
-    if height * width != patches:
-        raise ValueError('pooling grid does not match the patch count')
-    return F.max_pool2d(scores.reshape(frames, 1, height, width), 3, 1, 1).reshape(frames, patches)
+def _max_pool3(scores, grid):
+    return F.max_pool2d(scores.reshape(scores.shape[0], 1, grid[0], grid[1]),
+                        3, stride=1, padding=1).reshape(scores.shape[0], -1)
 
 
 def calibrate_thresholds(features, states, basis, config=CalibrationConfig(), device='cuda'):
-    """Fit state-cluster score statistics and clean thresholds."""
+    """Calibrate thresholds from clean data with leave-one-out exemplar minima.
+
+    The returned thresholds use the first alpha on the configured grid whose
+    row-weighted clean firing rate is at most ``target_fpr``.
+    """
     x = torch.as_tensor(np.asarray(features), device=device, dtype=torch.float32)
-    state, state_mean, state_scale = state_normalize(states)
-    state = state.to(device)
-    z_state = (state - state_mean.to(device)) / state_scale.to(device)
-    centers = z_state[torch.linspace(0, len(z_state) - 1, config.clusters, device=device).long()]
-    for _ in range(8):
-        labels = ((z_state[:, None] - centers[None]) ** 2).sum(-1).argmin(-1)
-        centers = torch.stack([z_state[labels == i].mean(0) if (labels == i).any() else centers[i]
-                               for i in range(config.clusters)])
-    background_mean = basis['mean'].to(device)
-    background_basis = basis['basis'].to(device)
+    state = torch.as_tensor(np.asarray(states), device=device, dtype=torch.float32)
+    normalized, state_mean, state_scale, centers, labels = _state_clusters(state, config.clusters)
+    mean = basis['mean'].to(device)
+    U = basis['basis'][:, :config.rank].to(device)
     residual = []
     for camera in range(x.shape[1]):
-        delta = x[:, camera] - background_mean[camera]
-        projection = delta @ background_basis[:, :config.rank]
-        residual.append(delta - projection @ background_basis[:, :config.rank].t())
+        delta = x[:, camera] - mean[camera]
+        projection = delta @ U
+        residual.append(delta - projection @ U.t())
     residual = torch.stack(residual, dim=1)
-    scale = residual.std(0, correction=0).clamp_min(1e-6)
-    terms = ((residual / scale) ** 2).mean(-1)
-    thresholds = torch.empty((config.clusters, x.shape[1], x.shape[2]), device=device)
+    residual_mean = residual.mean(0)
+    residual_scale = residual.std(0, correction=0).clamp_min(1e-6)
+
+    distances = ((normalized[:, None] - normalized[None]) ** 2).sum(-1)
+    distances.fill_diagonal_(float('inf'))
+    neighbour_indices = torch.topk(distances, config.k, largest=False).indices
+    scores = torch.empty((len(state), x.shape[1], x.shape[2]), device=device)
+    selected_rows = torch.empty((len(state), x.shape[1], x.shape[2]), device=device, dtype=torch.long)
+    for row in range(len(state)):
+        neighbours = neighbour_indices[row]
+        for camera in range(x.shape[1]):
+            score = exemplar_minimum_score(
+                residual[row, camera], residual[neighbours, camera], residual_scale[camera],
+                grid=config.grid, local_window=config.local_window,
+            )
+            scores[row, camera] = score
+            distance = ((residual[row, camera][None] - residual[neighbours, camera]) /
+                        residual_scale[camera][None]).square().mean(-1)
+            selected_rows[row, camera] = neighbours[distance.argmin(0)]
+    pooled = _max_pool3(scores.reshape(len(state) * x.shape[1], -1), config.grid)
+    pooled = pooled.reshape(len(state), x.shape[1], -1)
+
+    q90 = torch.empty((config.clusters, x.shape[1], x.shape[2]), device=device)
     for cluster in range(config.clusters):
-        block = terms[labels == cluster]
-        if not len(block):
-            block = terms
-        score = block.mean(-1)
-        pooled = _max_pool(score, config.grid) if config.pool == 'max3' else score
-        thresholds[cluster] = config.threshold_scale * torch.quantile(pooled, config.quantile, dim=0)
-    return dict(state_mean=state_mean.cpu(), state_scale=state_scale.cpu(),
-                centers=centers.cpu(), residual_scale=scale.cpu(),
-                thresholds=thresholds.cpu(), config=config.__dict__)
+        block = pooled[labels == cluster]
+        if len(block) == 0:
+            block = pooled
+        q90[cluster] = torch.quantile(block, config.quantile, dim=0)
+
+    chosen = None
+    fpr_by_alpha = []
+    for alpha in torch.arange(config.alpha_min, config.alpha_max + config.alpha_step / 2,
+                              config.alpha_step, device=device):
+        threshold = alpha * q90[labels]
+        fpr = float((pooled > threshold).float().mean().item())
+        fpr_by_alpha.append((float(alpha), fpr))
+        if chosen is None and fpr <= config.target_fpr:
+            chosen = float(alpha)
+    if chosen is None:
+        raise RuntimeError('alpha grid did not reach target clean FPR')
+
+    return {
+        'state_mean': state_mean.cpu(),
+        'state_scale': state_scale.cpu(),
+        'centers': centers.cpu(),
+        'residual_mean': residual_mean.cpu(),
+        'residual_scale': residual_scale.cpu(),
+        'selected_rows': selected_rows.cpu(),
+        'thresholds': (chosen * q90).cpu(),
+        'score_mean': torch.zeros((config.clusters, x.shape[1], x.shape[2], 3)),
+        'score_scale': torch.ones((config.clusters, x.shape[1], x.shape[2], 3)),
+        'alpha': chosen,
+        'fpr_by_alpha': fpr_by_alpha,
+        'config': config.__dict__,
+    }
